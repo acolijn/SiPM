@@ -2,6 +2,8 @@ from iminuit import Minuit
 import numpy as np
 import pandas as pd
 
+from copy import deepcopy
+
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.colors import BoundaryNorm
@@ -32,6 +34,12 @@ class GeoParameters:
 
     def get_sipms(self):
         return self.sipms
+
+    def __copy__(self):
+        G = GeoParameters(self.z_plane, self.r_cylinder, self.r_sipm)
+        for sipm in self.sipms:
+            G.add_sipm(sipm)
+        return G
 
 # -----------------------------------------------------------------------------------#
 class SiPM:
@@ -112,12 +120,13 @@ class Simulator:
         self.cost_range = [np.cos(0), np.cos(np.pi)]
         self.phi_range = [0, 2 * np.pi]
         # x0 of the UV photons
-        self.x0 = uv_position
+        self.x0 = np.array(uv_position)
         self.tdir = np.zeros(3)
 
         self.h_cost, self.h_cost_bins = np.histogram([], bins=1000, range=[-1.1, 1.1])
         self.h_cost_tmp = []
-        self.geo = geo
+        # in order to alllocate new memory locations for lists inside geometry
+        self.geo = deepcopy(geo)
 
     def get_x0(self):
         return self.x0
@@ -253,9 +262,9 @@ class Simulator:
 
 # -----------------------------------------------------------------------------------#
 class Reconstruction:
-    def __init__(self, geo, sim):
+    def __init__(self, sim):
         self.sim = sim
-        self.geo = geo
+        self.geo = sim.geo
 
     def generate_hit(self, nuv):
         # generate a hit based on the simulated response for a give position
@@ -270,8 +279,13 @@ class Reconstruction:
         return 0
 
     def reconstruct_position(self, method):
+        self.rate0 = 0
         self.xrec = [0, 0, 0]
+        self.status = 0
+
         fval = -1
+        chi2 = -1
+
         self.method = method
         if method == "COG":
             n = 0
@@ -280,7 +294,8 @@ class Reconstruction:
                 xs = xs + np.multiply(sipm.get_location(), sipm.get_number_of_hits())
                 n = n + sipm.get_number_of_hits()
             self.xrec = xs / n
-
+            self.rate0 = -1
+            self.status = 1
 
         else:  # model fit
             errordef = 0.0
@@ -325,7 +340,13 @@ class Reconstruction:
                 self.xrec = [-999, -999, -999]
                 self.status = 0
 
-        self.fdata = {'xr': self.xrec[0], 'yr': self.xrec[1], 'I': self.rate0, 'status': self.status, 'fval': fval}
+        if method != "COG":
+            self.method = "CHI2"
+            chi2 = self.lnlike.__call__(rate0=self.rate0,xpos=self.xrec[0],ypos=self.xrec[1])
+            self.method = method
+
+        self.fdata = {'xr': self.xrec[0], 'yr': self.xrec[1], 'I': self.rate0, 'status': self.status,
+                      'fval': fval, 'chi2': chi2}
 
         return self.fdata
 
@@ -470,6 +491,9 @@ class Reconstruction:
         df = self.df_rec[((self.df_rec.status == 1) & (self.df_rec.fval < fcut))]
 
         if type == "res":
+            #
+            # distributions of reconstructed position
+            #
             plt.figure(figsize=(7, 5))
 
             # histograms with x and y positions
@@ -515,7 +539,7 @@ class Reconstruction:
             plt.xlabel('$N_{UV}$ reconstructed')
 
             print(" N(UV) reco = ", df.I.mean(), " +/-", df.I.sem())
-        elif type == "fval":
+        elif type == "fit_quality":
             # fit quality
             plt.hist(df.fval, bins=bins, range=range)
             plt.xlabel('Fit quality')
@@ -539,9 +563,7 @@ class PosFit:
         for sipm in self.sipms:
 
             if sipm.get_number_of_hits() > -1:
-                self.xs.append(sipm.get_location()[0])
-                self.ys.append(sipm.get_location()[1])
-                self.zs.append(sipm.get_location()[2])
+                self.xs.append(sipm.get_location())
                 self.n.append(sipm.get_number_of_hits())
                 self.err.append(1)
 
@@ -555,17 +577,20 @@ class PosFit:
             #
             # calculate the number of expected photons
             #
-            nexp = self.nexp(rate0, xpos, ypos, i)
-
+            nexpected = self.nexp(rate0, xpos, ypos, i)
+            #
+            # number of oserved events
+            #
             N = self.n[i]
-            # if N==0:
-            #    print('WARNING: N =',N)
+
 
             if self.method == "CHI2":
-                res = self.n[i] - nexp
+                res = self.n[i] - nexpected
                 # lnlike = lnlike+res*res / (self.err[i]*self.err[i])
-                if nexp > 1e-6:
-                    lnlike = lnlike + res * res / nexp
+                #if nexpected > 1e-6:
+                lnlike = lnlike + res * res / nexpected
+                #lnlike = lnlike + res * res / self.n[i]
+
 
                 #if self.n[i] > 0:
                 #   lnlike = lnlike + res * res / self.nexp
@@ -574,12 +599,12 @@ class PosFit:
 
             elif self.method == "LNLIKE":
 
-                lnp = -nexp + N * np.log(nexp)
-
                 if (N < 100):  # exact calculation
-                    lnp = lnp - np.log(1. * np.math.factorial(N))
+                    ln_nfac = np.log(1. * np.math.factorial(N))
                 else:  # Stirling approximation for large N
-                    lnp = lnp - N * np.log(1. * N) + N
+                    ln_nfac = N * np.log(1. * N) - N
+
+                lnp = -nexpected + N * np.log(nexpected) - ln_nfac
 
                 lnlike = lnlike - lnp
             else:
@@ -591,15 +616,18 @@ class PosFit:
         """Calculate the expected number of photons hitting a SiPM"""
 
         xfit = np.array([xpos,ypos,0])
-        delta = np.array([self.xs[i],self.ys[i],self.zs[i]]) - xfit
+        delta = np.array(self.xs[i]) - xfit
+
         dist = np.linalg.norm(delta)
         dist2 = dist**2
 
-        # quantum efficiency
-        qe = self.sipms[i].qe
         # correct for the slid angle of the sensor
         cost = abs(np.dot(delta, self.sipms[i].get_normal_vector())/dist)
 
+        # quantum efficiency
+        qe = self.sipms[i].qe
+
+        # expected number of events
         yy = rate0 / dist2 * cost * qe
         return yy
 
