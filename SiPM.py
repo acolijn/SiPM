@@ -304,7 +304,7 @@ class Reconstruction:
             elif method == "LNLIKE":
                 errordef = 0.5
             else:
-                prin("Reconstruction::reconstruct_position() ERROR bad value of errordef:", errordef)
+                print("Reconstruction::reconstruct_position() ERROR bad value of errordef:", errordef)
 
             self.lnlike = PosFit(self.geo.get_sipms(), method)
             n0 = 1000
