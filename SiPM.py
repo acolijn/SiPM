@@ -43,7 +43,7 @@ class GeoParameters:
 
 # -----------------------------------------------------------------------------------#
 class SiPM:
-    """Class for a single silicon PM """
+    """ Class for a single silicon PM """
 
     def __init__(self, type, position, qeff):
         """__init__ Constructor """
