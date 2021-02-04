@@ -346,11 +346,15 @@ class Reconstruction:
         self.xrec = xs / n
         self.rate0 = -1
         self.status = 1
+        self.icontinue = 0
 
         # linearized likelihood fitter
         if method == "LINEAR":
-            testme = LinPosFit(self.geo.get_sipms(), area=self.geo.a_sipm)
-            self.xrec[0], self.xrec[1], self.rate0, self.xiter = testme.minimize()
+            testme = LinPosFit(self.geo.get_sipms(), area=self.geo.a_sipm, display=self.display, range=self.plot_range)
+            fit_result, self.xiter, self.icontinue = testme.minimize()
+            self.xrec[0] = fit_result[0]
+            self.xrec[1] = fit_result[1]
+            self.rate0 = fit_result[2]
             #print("result = ",self.xrec," ",self.rate0)
 
         # now if we wiish to do a likelihood fit..... here we go
@@ -432,9 +436,11 @@ class Reconstruction:
 
         # event display argument
         plot = kwargs.pop('plot',False)
+        self.display = plot
         method = kwargs.pop('method','LNLIKE')
         nbins = kwargs.pop('nbins',15)
-        plot_range = kwargs.pop('range',None)
+        self.plot_range = kwargs.pop('range',None)
+        plot_range = self.plot_range
 
         self.df_rec = pd.DataFrame()
 
@@ -457,15 +463,21 @@ class Reconstruction:
                 #
                 # plot the likelihood function
                 #
-                if (plot):
-                    self.event_display(nbins=nbins,range=plot_range,method=method)
-                    istat = int(input("Type: 0 to quit, 1 to continue, 2 to make pdf...."))
-                    if  istat == 0:
-                        return self.df_rec
-                    elif istat == 2:
-                        self.generate_pdf()
+                if plot:
+                    if self.method == "LINEAR":
+                        if self.icontinue == 2:
+                            return self.df_rec
+                    else:
+                        self.event_display(nbins=nbins,range=plot_range,method=method)
+                        istat = int(input("Type: 0 to quit, 1 to continue, 2 to make pdf...."))
+                        if  istat == 0:
+                            return self.df_rec
+                        elif istat == 2:
+                            self.generate_pdf()
 
                     clear_output()
+
+
 
         # print(df)
         print("reconstruction done")
@@ -501,8 +513,15 @@ class Reconstruction:
         dx, dy = 0.5, 0.5
 
         # generate 2 2d grids for the x & y bounds
-        y, x = np.mgrid[slice(plot_range[0][0], plot_range[0][1], dy),
-                        slice(plot_range[1][0], plot_range[1][1], dx)]
+        ##y, x = np.mgrid[slice(plot_range[0][0], plot_range[0][1], dy),
+        ##                slice(plot_range[1][0], plot_range[1][1], dx)]
+
+        x = np.arange(plot_range[0][0], plot_range[0][1], dx)
+        y = np.arange(plot_range[1][0], plot_range[1][1], dy)
+        #x = np.arange(-20,20, dx)
+        #y = np.arange(-15,15, dy)
+        print('x = ',x)
+        print('y = ',y)
 
         if (method == "LNLIKE") or (method == "CHI2"):
             z = np.zeros((len(x[0]),len(x[0])))
@@ -513,24 +532,29 @@ class Reconstruction:
                     z[i][j] = self.lnlike.__call__(rate0=self.fdata['I'], xpos=yy, ypos=xx, alpha=self.fdata['alpha'])
         elif method == "LINEAR":
 
-            z = np.zeros((len(x[0]),len(x[0])))
-            for i in range(len(x[0])):
-                for j in range(len(x[0])):
-                    xx = x[0][i]
-                    yy = x[0][j]
-                    z[i][j] = lpf_lnlike(np.array(self.xs), np.array(self.nhit), np.array([yy, xx, 0]) , self.fdata['I'], self.a_sipm)
+            z = np.zeros((len(y),len(x)))
+            print('Nx =', len(x), ' Ny =', len(y), " len z=", np.shape(z))
 
-        z = z[:-1, :-1]
+            for i in range(len(x)):
+                for j in range(len(y)):
+                    xx = x[i]
+                    yy = y[j]
+                    z[j][i] = lpf_lnlike(np.array(self.xs), np.array(self.nhit), np.array([xx, yy, 0]) , self.fdata['I'], self.a_sipm)
+
+        #z = z[:-1, :-1]
         levels = MaxNLocator(nbins=nbins).tick_values(z.min(), z.max())
 
         cmap = plt.get_cmap('PiYG')
+        cmap = plt.get_cmap('afmhot')
+
         norm = BoundaryNorm(levels, ncolors=cmap.N, clip=True)
 
         self.ax0 = self.fig.gca()
 
-        cf = self.ax0.contourf(x[:-1, :-1] + dx / 2.,
-                          y[:-1, :-1] + dy / 2., z, levels=levels,
-                          cmap=cmap)
+        #cf = self.ax0.contourf(x[:-1, :-1] + dx / 2.,
+        #                  y[:-1, :-1] + dy / 2., z, levels=levels,
+        #                  cmap=cmap)
+        cf = self.ax0.contourf(x+dx/2.,y+dy/2.,z,levels=levels,cmap=cmap)
         self.fig.colorbar(cf, ax=self.ax0)
         title_string = 'Event: {0:05d}  Fit: {1:s} I0: {2:d} I0_rec: {3:d}'\
             .format(self.i_event,self.method,self.n_uv,int(self.fdata['I']))
@@ -567,7 +591,7 @@ class Reconstruction:
 
         # initial position
         if method == "LINEAR":
-            plt.plot(self.xiter[0][0],self.xiter[0][1],'bo',markersize=10)
+            plt.plot(self.xiter[0][0],self.xiter[0][1],'o',markersize=10,color='cyan')
 
             xp = []
             yp = []
@@ -578,7 +602,7 @@ class Reconstruction:
             plt.plot(xp, yp, 'w-o',markersize=5)
 
         # true position
-        plt.plot(self.sim.get_x0()[0],self.sim.get_x0()[1],'bx',markersize=14)
+        plt.plot(self.sim.get_x0()[0],self.sim.get_x0()[1],'x',markersize=14, color='cyan')
         # reconstructed position
         if abs(self.fdata['xr'])<100:
             plt.plot(self.fdata['xr'],self.fdata['yr'],'wo',markersize=10)
@@ -678,6 +702,9 @@ class LinPosFit:
         self.xs = []
         self.nhit = []
         self.xfit = np.zeros(3)
+        self.plot_range = kwargs.pop('range',None)
+
+        self.display = kwargs.pop('display',False)
 
         nmax = -1
         for sipm in self.sipms:
@@ -708,9 +735,9 @@ class LinPosFit:
 
     def minimize(self):
 
-        x,y,n,xiter = lpf_minimize(np.array(self.xs), np.array(self.nhit), self.a_sipm)
+        result, xiter, istat = lpf_execute(np.array(self.xs), np.array(self.nhit), self.a_sipm, display=self.display, range=self.plot_range)
 
-        return x, y, n, xiter
+        return result, xiter, istat
 
 # -----------------------------------------------------------------------------------#
 class PosFit:

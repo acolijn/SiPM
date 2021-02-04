@@ -1,10 +1,41 @@
 import numpy as np
 from numba import njit
 
+# from matplotlib.colors import BoundaryNorm
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import MaxNLocator
+from IPython.display import clear_output
+
 # lpf = linearized position fit
 #
 # A.P. Colijn - Feb. 2021
 lpf_iter_max = 100
+
+
+def lpf_execute(xhit, nhit, area_sensor, **kwargs):
+    """
+    Execute the fitter
+
+    :param xhit:
+    :param nhit:
+    :param area_sensor:
+    :param kwargs:
+    :return:
+    """
+
+    # decode the arguments
+    display = kwargs.pop('display', False)
+    plot_range = kwargs.pop('range', None)
+
+    # minimize the likelihood
+    fit_result, xiter = lpf_minimize(xhit, nhit, area_sensor)
+
+    istatus = 0
+    if display:
+        istatus = lpf_event_display(xhit, nhit, fit_result, xiter, range=plot_range, nbins=100)
+
+    return fit_result, xiter, istatus
 
 
 @njit
@@ -26,11 +57,8 @@ def lpf_lnlike(xhit, nhit, xf, nuv, area_sensor):
 def lpf_lnlike_r(xhit, nhit, xf, r0):
     logl = 0
 
-    # print('next')
     for ih in range(len(nhit)):
         nexp = lpf_nexp(xhit[ih], xf, r0)
-        # print(xhit[ih], nexp, xf, r0)
-
         logl = logl + nexp - nhit[ih] * np.log(nexp)
 
     return logl
@@ -46,42 +74,47 @@ def lpf_initialize(xhit, nhit):
     :return:
     """
     nmax = -1
+    xhit_max = np.zeros(3)
     nn = 0
-    xfit = np.zeros(3)
     for ihit in range(len(nhit)):
         nh = nhit[ihit]
         if nh > -1:
             if nh > nmax:
                 # initialize fit to position under light detector with highest signal
                 nmax = nh
-                xfit[0] = xhit[ihit][0]
-                xfit[1] = xhit[ihit][1]
-
-        if nh > 1:
+                xhit_max[0] = xhit[ihit][0]
+                xhit_max[1] = xhit[ihit][1]
+                xhit_max[2] = xhit[ihit][2]
+        if nh > 0:
             nn = nn + 1
 
-    if nn < 3:
-        print("lpf_initialize:: WARNING not sensors hit. n=", nn)
-
-    r0 = nmax * xhit[0][2] ** 3
-    xfit[2] = 0
-
-    # r0 = 1000000 * area_sensor * xhit[0][2] / 4 / np.pi
-
+    if nn < 4:
+        print("WARNING: not enough hits. n=", nn)
+    # find where teh logL is minimal in the grid scan
+    #
     logl_min = 1e12
+
     xtemp = np.zeros(3)
-    for xxx in np.arange(xfit[0] - 50, xfit[0] + 50, 5.):
-        for yyy in np.arange(xfit[1] - 50, xfit[1] + 50, 5.):
+    xfit = np.zeros(3)
+    r0 = nmax * xhit_max[2] ** 3
+    # print("BEFORE: r0 =",r0)
+
+    for xxx in np.arange(xhit_max[0] - 2.5, xhit_max[0] + 2.5, 0.1):
+        for yyy in np.arange(xhit_max[1] - 2.5, xhit_max[1] + 2.5, 0.1):
             # print('xxx',xxx,'yyy',yyy)
             xtemp[0] = xxx
             xtemp[1] = yyy
-            logl = lpf_lnlike_r(xhit, nhit, xtemp, r0)
+            r0temp = nmax * lpf_dist(xhit_max, xtemp) ** 3
+
+            logl = lpf_lnlike_r(xhit, nhit, xtemp, r0temp)
 
             if logl < logl_min:
                 logl_min = logl
                 xfit[0] = xxx
                 xfit[1] = yyy
+                r0 = r0temp
 
+    # print("AFTER: r0 =", r0)
     return xfit, r0
 
 
@@ -93,7 +126,7 @@ def lpf_minimize(xhit, nhit, area_sensor):
     :param xhit: positions of the sensors (list with 3D arrays with length n-sensor)
     :param nhit: number of p.e. on each sensor (length n-sensor)
     :param area_sensor: area of teh sensor
-    :return: xf: fitted position
+    :return: fit_result: [0] = x, [1] = y, [2] = nuv [3] = lnlike
     :return: xiter: intermediate fit results
              nuv: number of emitted photons
     """
@@ -145,13 +178,22 @@ def lpf_minimize(xhit, nhit, area_sensor):
         xiter[lpf_iter + 1][2] = r0
         xiter[lpf_iter + 1][3] = lpf_lnlike_r(xhit, nhit, xfit, r0)
 
-        if (abs(result[0]) < 0.1) and abs(result[1] < 0.1):  # if position no longer changes -> terminate loop
+        if (abs(result[0]) < 0.01) and abs(result[1] < 0.01):  # if position no longer changes -> terminate loop
             break
 
     # calculate the number of uv photons
     #
     nuv = 4 * np.pi * r0 / area_sensor / xhit[0][2]
-    return xfit[0], xfit[1], nuv, xiter
+
+    # store teh fit results
+    #
+    fit_result = np.zeros(4)
+    fit_result[0] = xfit[0]
+    fit_result[1] = xfit[1]
+    fit_result[2] = nuv
+    fit_result[3] = lpf_lnlike_r(xhit, nhit, xfit, r0)
+
+    return fit_result, xiter
 
 
 @njit
@@ -317,4 +359,136 @@ def lpf_deriv_dist_min2(i, xi, xf):
         deriv = -(2 / d ** 3) * lpf_deriv_dist(i, xi, xf)
 
     return deriv
+
+
 # --------------------------------------------------------------------------------------- #
+def lpf_event_display(xhit, nhit, fit_result, xiter, **kwargs):
+    """
+    Event display
+
+    :param xhit:
+    :param nhit:
+    :param fit_result:
+    :param xiter:
+    :param kwargs:
+    :return:
+    """
+
+    plot_range = kwargs.pop('range', None)
+    nbins = kwargs.pop('nbins', 15)
+
+    if plot_range == 'None':
+        plot_range = ((0, 100), (0, 100))
+
+    print("Reconstruction::lpf_event_display() ")
+    fig = plt.figure(figsize=(16, 6))
+
+    gs = GridSpec(2, 2, figure=fig)
+    ax0 = plt.subplot(gs.new_subplotspec((0, 0), rowspan=2))
+    ax1 = plt.subplot(gs.new_subplotspec((0, 1), rowspan=1))
+    ax2 = plt.subplot(gs.new_subplotspec((1, 1), rowspan=1))
+
+    # ax1 = plt.subplot(222)
+    # ax2 = plt.subplot(224)
+
+    #    fig, ax0 = plt.subplots(nrows=1)
+
+    # make a list of the intermediate steps
+    xp = []
+    yp = []
+    nn = []
+    iter = []
+    for i in range(len(xiter)):
+        if xiter[i][3] != 0:
+            xp.append(xiter[i][0])
+            yp.append(xiter[i][1])
+            nn.append(xiter[i][2])
+            iter.append(i)
+    xp = np.array(xp)
+    yp = np.array(yp)
+    nn = np.array(nn)
+    iter = np.array(iter)
+
+    niter = len(xp)
+    ax1.plot(iter, xp-fit_result[0])
+    ax1.plot(iter, yp-fit_result[1])
+    ax1.set_xlabel('iteration')
+    ax2.plot(iter, nn)
+    ax2.set_xlabel('iteration')
+
+    # make these smaller to increase the resolution
+    dx, dy = 0.5, 0.5
+
+    # generate 2 2d grids for the x & y bounds
+    x = np.arange(plot_range[0][0], plot_range[0][1], dx)
+    y = np.arange(plot_range[1][0], plot_range[1][1], dy)
+    z = np.zeros((len(y), len(x)))
+
+    for i in range(len(x)):
+        for j in range(len(y)):
+            xx = x[i]
+            yy = y[j]
+            z[j][i] = lpf_lnlike_r(xhit, nhit, np.array([xx, yy, 0]), xiter[niter - 1][2])
+
+    # z = z[:-1, :-1]
+    levels = MaxNLocator(nbins=nbins).tick_values(z.min(), z.max())
+
+    # cmap = plt.get_cmap('afmhot')
+    cmap = plt.get_cmap('PiYG')
+
+    # norm = BoundaryNorm(levels, ncolors=cmap.N, clip=True)
+
+    # ax0 = fig.gca()
+
+    cf = ax0.contourf(x + dx / 2., y + dy / 2., z, levels=levels, cmap=cmap)
+    fig.colorbar(cf, ax=ax0)
+    title_string = 'x = {:8.2f} y = {:8.2f} r0= {:8.2f}'.format(fit_result[0], fit_result[1], fit_result[2])
+    ax0.set_title(title_string)
+
+    # add the light detectors
+    mx_eff = -1
+    for ih in range(len(nhit)):
+        if nhit[ih] > mx_eff:
+            mx_eff = nhit[ih]
+
+    for ih in range(len(nhit)):
+        # draw location of SiPM
+        xs = xhit[ih]
+
+        # plot SiPM only if in range
+        if (xs[0] > plot_range[0][0]) & (xs[0] < plot_range[0][1]) & \
+                (xs[1] > plot_range[1][0]) & (xs[1] < plot_range[1][1]):
+            dx = nhit[ih] / mx_eff * 5
+            sq = plt.Rectangle(xy=(xs[0] - dx / 2, xs[1] - dx / 2),
+                               height=dx,
+                               width=dx,
+                               fill=False, color='red')
+            ax0.add_artist(sq)
+            # write number of detected photons
+            txs = str(nhit[ih])
+            ax0.text(xs[0] + dx / 2 + 2.5, xs[1], txs, color='red')
+
+    # initial position
+    ax0.plot(xiter[0][0], xiter[0][1], 'o', markersize=10, color='cyan')
+    ax0.plot(xp, yp, 'w-o', markersize=5)
+
+    # true position
+    # plt.plot(self.sim.get_x0()[0], self.sim.get_x0()[1], 'x', markersize=14, color='cyan')
+    # reconstructed position
+    # if abs(self.fdata['xr']) < 100:
+    ax0.plot(fit_result[0], fit_result[1], 'wo', markersize=10)
+    ax0.set_xlabel('x (mm)', fontsize=18)
+    ax0.set_ylabel('y (mm)', fontsize=18)
+
+    plt.show()
+
+    istat = int(input("Type: 0 to continue, 1 to make pdf, 2 to quit...."))
+
+    if istat == 1:
+        fname = 'event.pdf'
+        fig.savefig(fname)
+        fname = 'event.png'
+        fig.savefig(fname)
+
+    clear_output()
+    return istat
