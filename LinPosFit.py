@@ -13,7 +13,7 @@ from IPython.display import clear_output
 lpf_iter_max = 100
 
 
-def lpf_execute(xhit, nhit, area_sensor, **kwargs):
+def lpf_execute(xhit, nhit, area_sensor):
     """
     Execute the fitter
 
@@ -24,19 +24,20 @@ def lpf_execute(xhit, nhit, area_sensor, **kwargs):
     :return:
     """
 
-    # decode the arguments
-    display = kwargs.pop('display', False)
-    plot_range = kwargs.pop('range', None)
+    xhit = np.array(xhit)
+    nhit = np.array(nhit)
 
     # minimize the likelihood
-    fit_result, xiter = lpf_minimize(xhit, nhit, area_sensor)
+    fit_result, xiter, hit_is_used = lpf_minimize(xhit, nhit, area_sensor)
 
-    istatus = 0
-    if display:
-        istatus = lpf_event_display(xhit, nhit, fit_result, xiter, range=plot_range, nbins=100)
+    return fit_result, xiter, hit_is_used
 
-    return fit_result, xiter, istatus
-
+@njit
+def lpf_factorial(x):
+    n = 1
+    for i in range(2, x+1):
+        n *= i
+    return n
 
 @njit
 def lpf_lnlike(xhit, nhit, xf, nuv, area_sensor):
@@ -52,6 +53,17 @@ def lpf_lnlike(xhit, nhit, xf, nuv, area_sensor):
 
     return logl
 
+@njit
+def lpf_lnlike_plot(xhit, nhit, hit_is_used, xf, r0):
+    logl = 0
+
+    for ih in range(len(nhit)):
+        nexp = lpf_nexp(xhit[ih], xf, r0)
+        d = lpf_dist(xhit[ih],xf)
+        if hit_is_used[ih] == 1:
+            logl = logl + nexp - nhit[ih] * np.log(nexp)
+
+    return logl
 
 @njit
 def lpf_lnlike_r(xhit, nhit, xf, r0):
@@ -62,7 +74,6 @@ def lpf_lnlike_r(xhit, nhit, xf, r0):
         logl = logl + nexp - nhit[ih] * np.log(nexp)
 
     return logl
-
 
 @njit
 def lpf_initialize(xhit, nhit):
@@ -82,14 +93,14 @@ def lpf_initialize(xhit, nhit):
             if nh > nmax:
                 # initialize fit to position under light detector with highest signal
                 nmax = nh
-                xhit_max[0] = xhit[ihit][0]
-                xhit_max[1] = xhit[ihit][1]
-                xhit_max[2] = xhit[ihit][2]
+                xhit_max = xhit[ihit]
+                #xhit_max[1] = xhit[ihit][1]
+                #xhit_max[2] = xhit[ihit][2]
         if nh > 0:
             nn = nn + 1
 
-    if nn < 4:
-        print("WARNING: not enough hits. n=", nn)
+    #if nn < 4:
+    #    print("WARNING: not enough hits. n=", nn)
     # find where teh logL is minimal in the grid scan
     #
     logl_min = 1e12
@@ -99,22 +110,22 @@ def lpf_initialize(xhit, nhit):
     r0 = nmax * xhit_max[2] ** 3
     # print("BEFORE: r0 =",r0)
 
-    for xxx in np.arange(xhit_max[0] - 2.5, xhit_max[0] + 2.5, 0.1):
-        for yyy in np.arange(xhit_max[1] - 2.5, xhit_max[1] + 2.5, 0.1):
-            # print('xxx',xxx,'yyy',yyy)
-            xtemp[0] = xxx
-            xtemp[1] = yyy
-            r0temp = nmax * lpf_dist(xhit_max, xtemp) ** 3
+    for xxx in np.arange(xhit_max[0] - 20, xhit_max[0] + 20, 2.5):
+        for yyy in np.arange(xhit_max[1] - 20, xhit_max[1] + 20, 2.5):
+            
+            if np.sqrt(xxx**2+yyy**2)<60:
+                xtemp[0] = xxx
+                xtemp[1] = yyy
 
-            logl = lpf_lnlike_r(xhit, nhit, xtemp, r0temp)
+                r0temp = nmax*lpf_dist(xhit_max,xtemp)**3
+                logl = lpf_lnlike_r(xhit, nhit, xtemp, r0temp)
 
-            if logl < logl_min:
-                logl_min = logl
-                xfit[0] = xxx
-                xfit[1] = yyy
-                r0 = r0temp
+                if logl < logl_min:
+                    logl_min = logl
+                    xfit[0] = xxx
+                    xfit[1] = yyy
+                    r0 = r0temp
 
-    # print("AFTER: r0 =", r0)
     return xfit, r0
 
 
@@ -135,14 +146,17 @@ def lpf_minimize(xhit, nhit, area_sensor):
     xfit, r0 = lpf_initialize(xhit, nhit)
 
     # arrays to store teh fit resuults for each iteration
-    xiter = np.zeros((lpf_iter_max + 1, 4))
+    xiter = np.zeros((lpf_iter_max + 1, 5))
     xiter[0][0] = xfit[0]
     xiter[0][1] = xfit[1]
     xiter[0][2] = r0
     xiter[0][3] = lpf_lnlike_r(xhit, nhit, xfit, r0)
-
+    xiter[0][4] = 0
+    
     # iterate & minimize
     #
+    hit_is_used = np.zeros(len(nhit))
+    n_in_fit = 0
     for lpf_iter in range(lpf_iter_max):
         # initialize error matrix and vector
         #
@@ -151,14 +165,36 @@ def lpf_minimize(xhit, nhit, area_sensor):
 
         # calculate the sums
         #
+        # print(lpf_iter,' xin =',xfit,' r0=',r0)
+        n_in_fit = 0 # reset after each iteration
         for isensor in range(len(nhit)):
-            for i in range(3):
-                g[i] = g[i] + lpf_f(i, xhit[isensor], nhit[isensor], xfit, r0)
-                for j in range(3):
-                    m[i][j] = m[i][j] + lpf_deriv_f(i, j, xhit[isensor], nhit[isensor], xfit, r0)
+            hit_is_used[isensor] = 0
+            #if nhit[isensor] > -1:
+            nexp = lpf_nexp(xhit[isensor],xfit,r0)
+            if nhit[isensor]<10:
+                nfac = lpf_factorial(int(nhit[isensor]))
+                log_nfac = np.log(nfac)
+            else:
+                log_nfac = nhit[isensor]*np.log(nhit[isensor]) - nhit[isensor]
+            log_prob = nhit[isensor]*np.log(nexp) - nexp - log_nfac
+            d = lpf_dist(xfit,xhit[isensor])
+        
+            if (log_prob > np.log(1e-1)) and (nhit[isensor]>0):
+            #if (d<25.) and (nhit[isensor]>0):
+                n_in_fit = n_in_fit+1
+                hit_is_used[isensor] = 1
+                for i in range(3):
+                    g[i] = g[i] + lpf_f(i, xhit[isensor], nhit[isensor], xfit, r0)
+                    for j in range(3):
+                        m[i][j] = m[i][j] + lpf_deriv_f(i, j, xhit[isensor], nhit[isensor], xfit, r0)
 
+        # print(lpf_iter,' n hit in fit =',n_in_fit)
         # invert the matrix
         #
+        if np.linalg.det(m) == 0.:
+            print('lpf_minimize:: singular error matrix')
+            break
+        
         minv = np.linalg.inv(m)
         # multiply with vector to get corrections to the current fit parameters
         #
@@ -169,6 +205,10 @@ def lpf_minimize(xhit, nhit, area_sensor):
         #    print('WARNING:: result = ',result)
 
         # update fit result
+        #if lpf_iter<5:
+        #    result[0] = 0
+        #    result[1] = 0
+
         xfit[0] = xfit[0] - result[0]
         xfit[1] = xfit[1] - result[1]
         r0 = r0 - result[2]
@@ -177,8 +217,10 @@ def lpf_minimize(xhit, nhit, area_sensor):
         xiter[lpf_iter + 1][1] = xfit[1]
         xiter[lpf_iter + 1][2] = r0
         xiter[lpf_iter + 1][3] = lpf_lnlike_r(xhit, nhit, xfit, r0)
+        xiter[lpf_iter + 1][4] = n_in_fit
 
-        if (abs(result[0]) < 0.01) and abs(result[1] < 0.01):  # if position no longer changes -> terminate loop
+        #if (lpf_iter>=5) and (abs(result[0]) < 0.01) and (abs(result[1]) < 0.01) or (r0<0):  # if position no longer changes -> terminate loop
+        if (abs(result[0]) < 0.01) and (abs(result[1]) < 0.01) or (r0<0):  # if position no longer changes -> terminate loop
             break
 
     # calculate the number of uv photons
@@ -187,13 +229,14 @@ def lpf_minimize(xhit, nhit, area_sensor):
 
     # store teh fit results
     #
-    fit_result = np.zeros(4)
+    fit_result = np.zeros(5)
     fit_result[0] = xfit[0]
     fit_result[1] = xfit[1]
     fit_result[2] = nuv
     fit_result[3] = lpf_lnlike_r(xhit, nhit, xfit, r0)
+    fit_result[4] = n_in_fit
 
-    return fit_result, xiter
+    return fit_result, xiter, hit_is_used
 
 
 @njit
@@ -233,6 +276,8 @@ def lpf_f(i, xi, ni, xf, r0):
         f = -3 * (xf[i] - xi[i]) * (lpf_nexp(xi, xf, r0) - ni) / lpf_dist(xi, xf) ** 2
     elif i == 2:
         f = (lpf_nexp(xi, xf, r0) - ni) / r0
+        #f = (lpf_nexp(xi, xf, r0) - ni)
+
 
     return f
 
@@ -284,6 +329,12 @@ def lpf_deriv_f(i, j, xi, ni, xf, r0):
         elif j == 2:  # dF1/dr0
             deriv = -3 * dy * lpf_deriv_n(2, xi, xf, r0) / d ** 2
     elif i == 2:
+        #if j == 0:
+        #    deriv = lpf_deriv_n(0, xi, xf, r0)
+        #elif j == 1:
+        #    deriv = lpf_deriv_n(1, xi, xf, r0)
+        #elif j == 2:
+        #    deriv = lpf_deriv_n(2, xi, xf, r0)
         if j == 0:
             deriv = lpf_deriv_n(0, xi, xf, r0) / r0
         elif j == 1:
@@ -362,24 +413,32 @@ def lpf_deriv_dist_min2(i, xi, xf):
 
 
 # --------------------------------------------------------------------------------------- #
-def lpf_event_display(xhit, nhit, fit_result, xiter, **kwargs):
+def lpf_event_display(xhit, nhit, fit_result, hit_is_used, xiter, **kwargs):
     """
     Event display
 
     :param xhit:
     :param nhit:
     :param fit_result:
+    :param hit-is_used: 
     :param xiter:
     :param kwargs:
     :return:
     """
+    
+    xhit = np.array(xhit)
+    nhit = np.array(nhit)
 
     plot_range = kwargs.pop('range', None)
+    zoom = kwargs.pop('zoom',-1)
     nbins = kwargs.pop('nbins', 15)
 
     if plot_range == 'None':
         plot_range = ((0, 100), (0, 100))
 
+    if zoom > 0:
+        plot_range = ((fit_result[0]-zoom/2,fit_result[0]+zoom/2),(fit_result[1]-zoom/2,fit_result[1]+zoom/2))
+        
     print("Reconstruction::lpf_event_display() ")
     fig = plt.figure(figsize=(16, 6))
 
@@ -397,38 +456,41 @@ def lpf_event_display(xhit, nhit, fit_result, xiter, **kwargs):
     xp = []
     yp = []
     nn = []
-    iter = []
+    iiter = []
     for i in range(len(xiter)):
         if xiter[i][3] != 0:
             xp.append(xiter[i][0])
             yp.append(xiter[i][1])
             nn.append(xiter[i][2])
-            iter.append(i)
+            iiter.append(i)
     xp = np.array(xp)
     yp = np.array(yp)
     nn = np.array(nn)
-    iter = np.array(iter)
+    iiter = np.array(iiter)
 
     niter = len(xp)
-    ax1.plot(iter, xp-fit_result[0])
-    ax1.plot(iter, yp-fit_result[1])
+    ax1.plot(iiter, xp-fit_result[0])
+    ax1.plot(iiter, yp-fit_result[1])
     ax1.set_xlabel('iteration')
-    ax2.plot(iter, nn)
+    ax2.plot(iiter, nn)
     ax2.set_xlabel('iteration')
 
     # make these smaller to increase the resolution
-    dx, dy = 0.5, 0.5
+    dx, dy = (plot_range[0][1]-plot_range[0][0])/400,(plot_range[1][1]-plot_range[1][0])/400
 
     # generate 2 2d grids for the x & y bounds
     x = np.arange(plot_range[0][0], plot_range[0][1], dx)
     y = np.arange(plot_range[1][0], plot_range[1][1], dy)
     z = np.zeros((len(y), len(x)))
 
+    #print(x,y)
     for i in range(len(x)):
         for j in range(len(y)):
             xx = x[i]
             yy = y[j]
-            z[j][i] = lpf_lnlike_r(xhit, nhit, np.array([xx, yy, 0]), xiter[niter - 1][2])
+            xff = np.array([xx,yy,0])
+            #print('xfit =',xff,' r0 =',xiter[niter-1][2])
+            z[j][i] = lpf_lnlike_plot(xhit, nhit, hit_is_used, xff, xiter[niter-1][2])
 
     # z = z[:-1, :-1]
     levels = MaxNLocator(nbins=nbins).tick_values(z.min(), z.max())
@@ -455,18 +517,32 @@ def lpf_event_display(xhit, nhit, fit_result, xiter, **kwargs):
         # draw location of SiPM
         xs = xhit[ih]
 
-        # plot SiPM only if in range
+        # plot sensor only if in range
         if (xs[0] > plot_range[0][0]) & (xs[0] < plot_range[0][1]) & \
                 (xs[1] > plot_range[1][0]) & (xs[1] < plot_range[1][1]):
-            dx = nhit[ih] / mx_eff * 5
-            sq = plt.Rectangle(xy=(xs[0] - dx / 2, xs[1] - dx / 2),
-                               height=dx,
-                               width=dx,
-                               fill=False, color='red')
+            #dx = nhit[ih] / mx_eff *10 
+            rr = (nhit[ih]+0.25) / mx_eff *10
+            #sq = plt.Rectangle(xy=(xs[0] - dx / 2, xs[1] - dx / 2),
+            #                   height=dx,
+            #                   width=dx,
+            #                   fill=False, color='red')
+            if nhit[ih]>0:
+                if hit_is_used[ih]:
+                    color = 'red'
+                else:
+                    color = 'black'
+                sq = plt.Circle(xy=(xs[0], xs[1]),
+                                radius=rr,
+                                fill=False, color=color)
+            else:
+                sq = plt.Circle(xy=(xs[0], xs[1]),
+                                radius=rr,
+                                fill=False, color='black')
+
             ax0.add_artist(sq)
             # write number of detected photons
-            txs = str(nhit[ih])
-            ax0.text(xs[0] + dx / 2 + 2.5, xs[1], txs, color='red')
+            ### txs = str(nhit[ih])
+            ### ax0.text(xs[0] + dx / 2 + 2.5, xs[1], txs, color='red')
 
     # initial position
     ax0.plot(xiter[0][0], xiter[0][1], 'o', markersize=10, color='cyan')
@@ -479,7 +555,8 @@ def lpf_event_display(xhit, nhit, fit_result, xiter, **kwargs):
     ax0.plot(fit_result[0], fit_result[1], 'wo', markersize=10)
     ax0.set_xlabel('x (mm)', fontsize=18)
     ax0.set_ylabel('y (mm)', fontsize=18)
-
+    ax0.set_xlim([plot_range[0][0],plot_range[0][1]])
+    ax0.set_ylim([plot_range[1][0],plot_range[1][1]])
     plt.show()
 
     istat = int(input("Type: 0 to continue, 1 to make pdf, 2 to quit...."))
