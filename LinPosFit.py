@@ -11,6 +11,12 @@ from IPython.display import clear_output
 #
 # A.P. Colijn - Feb. 2021
 lpf_iter_max = 100
+lpf_min_position_cor = 0.001 # convergence criterium for position minimizer
+lpf_npar = 4 # number of fit parameters
+#                       x      y      r0     gamma
+lpf_fix_par = np.array([False, False, False, False]) # which parameters to fix
+#
+debug = False
 
 
 def lpf_execute(xhit, nhit, area_sensor):
@@ -29,7 +35,6 @@ def lpf_execute(xhit, nhit, area_sensor):
 
     # minimize the likelihood
     fit_result, xiter, hit_is_used = lpf_minimize(xhit, nhit, area_sensor)
-
     return fit_result, xiter, hit_is_used
 
 @njit
@@ -72,7 +77,7 @@ def lpf_lnlike_r(xhit, nhit, xf, r0):
     for ih in range(len(nhit)):
         nexp = lpf_nexp(xhit[ih], xf, r0)
         logl = logl + nexp - nhit[ih] * np.log(nexp)
-
+ 
     return logl
 
 @njit
@@ -85,49 +90,124 @@ def lpf_initialize(xhit, nhit):
     :return:
     """
     nmax = -1
+
     xhit_max = np.zeros(3)
-    nn = 0
-    for ihit in range(len(nhit)):
-        nh = nhit[ihit]
-        if nh > -1:
-            if nh > nmax:
-                # initialize fit to position under light detector with highest signal
-                nmax = nh
-                xhit_max = xhit[ihit]
-                #xhit_max[1] = xhit[ihit][1]
-                #xhit_max[2] = xhit[ihit][2]
-        if nh > 0:
-            nn = nn + 1
-
-    #if nn < 4:
-    #    print("WARNING: not enough hits. n=", nn)
-    # find where teh logL is minimal in the grid scan
+    # sort hits in descending order. helps when looping over the hits
     #
-    logl_min = 1e12
-
-    xtemp = np.zeros(3)
+    indices = np.argsort(-nhit) # descending order
+    
+    # find a cluster of hits
+    #
+    # 1. we start with the highest hit in the event
+    # 2. if it is surrrounded by other hits then we found a cluster and we are done
+    # 3. if not: continue at 1. with the second highest hit in the event
+    # 4. repeat until we checked all possibilities
+    # 5. if no cluster was found we use the highest hit as the initial fit position
+    #
+    
+    # only consider hits within distance dist_min
+    #
+    dist_min = 25.
+    #  - maximum fraction of the cluster signal allowed to be inside the leading hit
+    #  - below this fraction we assume that we are dealing with a hit cluster
+    hit_frac_cut = 0.75
+    found_cluster = False
+    
+    # loop starting from the highest hit
+    #
+    xcluster = np.zeros(3)
+    for i in range(len(indices)-1):
+        index = indices[i]
+        xhit_max = xhit[index]
+        # the seed hit has signal xmax
+        #
+        nmax = nhit[index]
+        
+        # we have reached the zero-signal PMTs..... no cluster was found, so leave this loop
+        #
+        if nmax == 0:
+            break
+        
+        # n_around indicates the amount of signal that is found around the seed hit
+        #
+        n_around = 0
+        
+        # check the other hits....
+        #
+        xcluster = nhit[index]*xhit[index]
+        for j in range(i+1, len(indices)):
+            jindex = indices[j]
+            xtest = xhit[jindex]
+            dist = lpf_dist(xhit_max, xtest)
+            # consider the hit if it is near the seed hit
+            #
+            if dist<dist_min:
+                n_around = n_around + nhit[jindex]
+                xcluster = xcluster + nhit[jindex]*xhit[jindex]
+        # calculate the fraction of the cluster signal in the seed hit
+        #
+        hit_frac = 1.*nmax/(nmax+n_around)
+        # if the fraction is below hit_frac_cut we are dealing with a cluster 
+        # 
+        if hit_frac<hit_frac_cut:
+            found_cluster = True
+            break
+            
+    # no cluster was found... best guess is to use the hit with the maximum signal as initial position
+    #
+    if not found_cluster: # use maximum hit
+        nmax = nhit[indices[0]]
+        xhit_max = xhit[indices[0]]
+    else:
+        xhit_max = xcluster / (nmax+n_around)
+    
+    if debug:
+        print('--- lpf_initialize --- hit fraction = ',hit_frac)
+        print('--- lpf_initialize --- found_cluster = ',found_cluster)
+    
+    # refine the determination of the initial position
+    # logl_min = 1e12
+    # xtemp = np.zeros(3)
     xfit = np.zeros(3)
+    xfit[0] = xhit_max[0]
+    xfit[1] = xhit_max[1]
+    xfit[2] = 0.
+    # estimate the fitted rate
+    #
     r0 = nmax * xhit_max[2] ** 3
     # print("BEFORE: r0 =",r0)
 
-    for xxx in np.arange(xhit_max[0] - 20, xhit_max[0] + 20, 2.5):
-        for yyy in np.arange(xhit_max[1] - 20, xhit_max[1] + 20, 2.5):
-            
-            if np.sqrt(xxx**2+yyy**2)<60:
-                xtemp[0] = xxx
-                xtemp[1] = yyy
-
-                r0temp = nmax*lpf_dist(xhit_max,xtemp)**3
-                logl = lpf_lnlike_r(xhit, nhit, xtemp, r0temp)
-
-                if logl < logl_min:
-                    logl_min = logl
-                    xfit[0] = xxx
-                    xfit[1] = yyy
-                    r0 = r0temp
+    # grid search around the estimate of the initial fit position
+    #
+    
+    #for xxx in np.arange(xhit_max[0] - 20, xhit_max[0] + 20, 2.5):
+    #    for yyy in np.arange(xhit_max[1] - 20, xhit_max[1] + 20, 2.5):
+    #        
+    #        if np.sqrt(xxx**2+yyy**2)<60:
+    #            xtemp[0] = xxx
+    #            xtemp[1] = yyy
+    # 
+    #            r0temp = nmax*lpf_dist(xhit_max,xtemp)**3
+    #            logl = lpf_lnlike_r(xhit, nhit, xtemp, r0temp)
+    #
+    #            if logl < logl_min:
+    #                logl_min = logl
+    #                xfit[0] = xxx
+    #                xfit[1] = yyy
+    #                r0 = r0temp
 
     return xfit, r0
 
+@njit
+def lpf_hit_prob(xi, ni, xf, r0):
+    nexp = lpf_nexp(xi, xf, r0)
+    if ni<10: # explicit calculation of ln(n!)
+        nfac = lpf_factorial(ni)
+        log_nfac = np.log(nfac)
+    else: # use Stirlings formula to approximate ln(n!)
+        log_nfac = ni*np.log(ni) - ni
+    log_prob = ni*np.log(nexp) - nexp - log_nfac
+    return log_prob
 
 @njit
 def lpf_minimize(xhit, nhit, area_sensor):
@@ -146,81 +226,93 @@ def lpf_minimize(xhit, nhit, area_sensor):
     xfit, r0 = lpf_initialize(xhit, nhit)
 
     # arrays to store teh fit resuults for each iteration
-    xiter = np.zeros((lpf_iter_max + 1, 5))
+    xiter = np.zeros((lpf_iter_max + 1, 6))
     xiter[0][0] = xfit[0]
     xiter[0][1] = xfit[1]
     xiter[0][2] = r0
     xiter[0][3] = lpf_lnlike_r(xhit, nhit, xfit, r0)
     xiter[0][4] = 0
+    xiter[0][5] = 0
     
     # iterate & minimize
     #
     hit_is_used = np.zeros(len(nhit))
     n_in_fit = 0
+    # log_pmin: minimal probability for a hit to be used in teh position fit
+    #
+    log_pmin = np.log(1e-10)
+    nmax = np.amax(nhit)
+    gamma = 0.0
     for lpf_iter in range(lpf_iter_max):
         # initialize error matrix and vector
         #
-        g = np.zeros(3)
-        m = np.zeros((3, 3))
+        g = np.zeros(lpf_npar)
+        m = np.zeros((lpf_npar, lpf_npar))
 
         # calculate the sums
         #
         # print(lpf_iter,' xin =',xfit,' r0=',r0)
         n_in_fit = 0 # reset after each iteration
         for isensor in range(len(nhit)):
-            hit_is_used[isensor] = 0
-            #if nhit[isensor] > -1:
-            nexp = lpf_nexp(xhit[isensor],xfit,r0)
-            if nhit[isensor]<10:
-                nfac = lpf_factorial(int(nhit[isensor]))
-                log_nfac = np.log(nfac)
-            else:
-                log_nfac = nhit[isensor]*np.log(nhit[isensor]) - nhit[isensor]
-            log_prob = nhit[isensor]*np.log(nexp) - nexp - log_nfac
-            d = lpf_dist(xfit,xhit[isensor])
-        
-            if (log_prob > np.log(1e-1)) and (nhit[isensor]>0):
-            #if (d<25.) and (nhit[isensor]>0):
+            if lpf_iter==0:
+                hit_is_used[isensor] = 0
+            # calculate the probability that a hit comes from the assumed xhit and r0
+            #
+            log_prob = lpf_hit_prob(xhit[isensor], nhit[isensor], xfit, r0)
+            # print(isensor,' xhit =',xhit[isensor],' logP =',np.exp(log_prob),' ni =', nhit[isensor])
+            #if (log_prob > log_pmin) and (nhit[isensor]>0):
+            if ((lpf_iter == 0)  and (nhit[isensor] > nmax*0.05) and (lpf_dist(xhit[isensor],xfit) < 25.)) or (hit_is_used[isensor] == 1):
                 n_in_fit = n_in_fit+1
-                hit_is_used[isensor] = 1
-                for i in range(3):
+                if lpf_iter == 0:
+                    hit_is_used[isensor] = 1
+                for i in range(lpf_npar):
+                    #if not lpf_fix_par[i]:
                     g[i] = g[i] + lpf_f(i, xhit[isensor], nhit[isensor], xfit, r0)
-                    for j in range(3):
+                    for j in range(lpf_npar):
+                        #if not lpf_fix_par[j]:
                         m[i][j] = m[i][j] + lpf_deriv_f(i, j, xhit[isensor], nhit[isensor], xfit, r0)
 
+        #for i in range(lpf_npar):
+        #    if lpf_fix_par[i]:
+        #        for j in range(lpf_npar):
+        #            if i==j:
+        #                m[i][j] = 1
+        #            else:
+        #                m[i][j] = 0
         # print(lpf_iter,' n hit in fit =',n_in_fit)
         # invert the matrix
         #
         if np.linalg.det(m) == 0.:
-            print('lpf_minimize:: singular error matrix')
+            # print('lpf_minimize:: singular error matrix')
             break
         
         minv = np.linalg.inv(m)
         # multiply with vector to get corrections to the current fit parameters
         #
-        # result = minv.dot(g)
         result = np.dot(minv, g)
 
         # if abs(result[1])>1000:
         #    print('WARNING:: result = ',result)
 
         # update fit result
-        #if lpf_iter<5:
-        #    result[0] = 0
-        #    result[1] = 0
-
         xfit[0] = xfit[0] - result[0]
         xfit[1] = xfit[1] - result[1]
         r0 = r0 - result[2]
-
+        gamma = gamma - result[3]
+        #if r0 - result[2] <0:
+        #    r0 = r0
+        #else:
+        #    r0 = r0 - result[2]
         xiter[lpf_iter + 1][0] = xfit[0]
         xiter[lpf_iter + 1][1] = xfit[1]
         xiter[lpf_iter + 1][2] = r0
         xiter[lpf_iter + 1][3] = lpf_lnlike_r(xhit, nhit, xfit, r0)
         xiter[lpf_iter + 1][4] = n_in_fit
+        xiter[lpf_iter + 1][5] = 0
 
-        #if (lpf_iter>=5) and (abs(result[0]) < 0.01) and (abs(result[1]) < 0.01) or (r0<0):  # if position no longer changes -> terminate loop
-        if (abs(result[0]) < 0.01) and (abs(result[1]) < 0.01) or (r0<0):  # if position no longer changes -> terminate loop
+
+        # if (lpf_iter>=5) and (abs(result[0]) < 0.01) and (abs(result[1]) < 0.01) or (r0<0):  # if position no longer changes -> terminate loop
+        if (abs(result[0]) < lpf_min_position_cor) and (abs(result[1]) < lpf_min_position_cor) or (r0<0):  # if position no longer changes -> terminate loop
             break
 
     # calculate the number of uv photons
@@ -229,12 +321,21 @@ def lpf_minimize(xhit, nhit, area_sensor):
 
     # store teh fit results
     #
-    fit_result = np.zeros(5)
+    fit_result = np.zeros(6)
     fit_result[0] = xfit[0]
     fit_result[1] = xfit[1]
     fit_result[2] = nuv
-    fit_result[3] = lpf_lnlike_r(xhit, nhit, xfit, r0)
+    
+    logl = 0
+    for ih in range(len(nhit)):
+        if nhit[ih] > 0:
+            logprob = lpf_hit_prob(xhit[ih], nhit[ih], xfit, r0)
+            if logprob>log_pmin:
+                logl = logl + lpf_hit_prob(xhit[ih], nhit[ih], xfit, r0)
+
+    fit_result[3] = logl # lpf_lnlike_r(xhit, nhit, xfit, r0)
     fit_result[4] = n_in_fit
+    fit_result[5] = gamma
 
     return fit_result, xiter, hit_is_used
 
@@ -264,6 +365,7 @@ def lpf_f(i, xi, ni, xf, r0):
     0=F0 (x)
     1=F1 (y)
     2=F2 (r0)
+    3=F3 (gamma) 
     :param xi: sensor position
     :param ni: hits for the sensor
     :param xf: assumed fit position
@@ -276,7 +378,8 @@ def lpf_f(i, xi, ni, xf, r0):
         f = -3 * (xf[i] - xi[i]) * (lpf_nexp(xi, xf, r0) - ni) / lpf_dist(xi, xf) ** 2
     elif i == 2:
         f = (lpf_nexp(xi, xf, r0) - ni) / r0
-        #f = (lpf_nexp(xi, xf, r0) - ni)
+    elif i == 3:
+        f = 1. - ni / lpf_nexp(xi, xf, r0)
 
 
     return f
@@ -317,6 +420,8 @@ def lpf_deriv_f(i, j, xi, ni, xf, r0):
             deriv = deriv - 3 * dx * lpf_deriv_n(1, xi, xf, r0) / d ** 2
         elif j == 2:  # dF0/dr0
             deriv = -3 * dx * lpf_deriv_n(2, xi, xf, r0) / d ** 2
+        elif j == 3: #dF0/dgamma
+            deriv = -3 * dx * lpf_deriv_n(3, xi, xf, r0) / d ** 2        
     elif i == 1:
         dy = xf[1] - xi[1]
         if j == 0:  # dF1/dx
@@ -328,6 +433,8 @@ def lpf_deriv_f(i, j, xi, ni, xf, r0):
             deriv = deriv - 3 * dy * lpf_deriv_n(1, xi, xf, r0) / d ** 2
         elif j == 2:  # dF1/dr0
             deriv = -3 * dy * lpf_deriv_n(2, xi, xf, r0) / d ** 2
+        elif j == 3: #dF0/dgamma
+            deriv = -3 * dy * lpf_deriv_n(3, xi, xf, r0) / d ** 2 
     elif i == 2:
         #if j == 0:
         #    deriv = lpf_deriv_n(0, xi, xf, r0)
@@ -341,6 +448,13 @@ def lpf_deriv_f(i, j, xi, ni, xf, r0):
             deriv = lpf_deriv_n(1, xi, xf, r0) / r0
         elif j == 2:
             deriv = lpf_deriv_n(2, xi, xf, r0) / r0 - (n0 - ni) / r0 ** 2
+        elif j == 3:
+            deriv = lpf_deriv_n(3, xi, xf, r0) / r0
+    elif i == 3:
+        deriv = ni * lpf_deriv_n(j, xi, xf, r0) / n0 ** 2
+    else:
+        deriv = 0.
+        
 
     return deriv
 
@@ -354,6 +468,7 @@ def lpf_deriv_n(i, xi, xf, r0):
     0=x
     1=y
     2=r0
+    3=gamma
     :param xi: hit position
     :param xf: fit position
     :param r0: number of photons
@@ -364,6 +479,8 @@ def lpf_deriv_n(i, xi, xf, r0):
         deriv = -3 * lpf_nexp(xi, xf, r0) * (xf[i] - xi[i]) / lpf_dist(xi, xf) ** 2
     elif i == 2:
         deriv = lpf_nexp(xi, xf, r0) / r0
+    elif i == 3:
+        deriv = 1.
     else:
         deriv = 0.
 
